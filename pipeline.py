@@ -353,22 +353,46 @@ class GoogleSheetSyncManager:
             return False
 
         try:
-            # Load credentials dict from string or filepath
-            info_str = self.service_account_info.strip()
+            import base64
+            info_str = self.service_account_info.strip().strip("'\"").strip()
+            if info_str.startswith("\ufeff"):
+                info_str = info_str[1:].strip()
+
+            creds_dict = None
             if info_str.startswith("{"):
                 creds_dict = json.loads(info_str)
-                self.client = gspread.service_account_from_dict(creds_dict)
             elif os.path.exists(info_str):
                 self.client = gspread.service_account(filename=info_str)
             else:
-                logger.error("GOOGLE_SERVICE_ACCOUNT_JSON is neither valid JSON nor an existing file path.")
+                # Attempt base64 decoding if user base64-encoded it
+                try:
+                    decoded = base64.b64decode(info_str).decode("utf-8").strip()
+                    if decoded.startswith("{"):
+                        creds_dict = json.loads(decoded)
+                except Exception:
+                    pass
+
+            if creds_dict:
+                self.client = gspread.service_account_from_dict(creds_dict)
+            elif not self.client:
+                preview = info_str[:50].replace('\n', ' ')
+                logger.error(
+                    f"GOOGLE_SERVICE_ACCOUNT_JSON is invalid! It does not start with '{{' and is not an existing file path. "
+                    f"Preview received: '{preview}...' (Length: {len(info_str)}). "
+                    "Make sure to copy-paste the ENTIRE contents of the .json file (starting with {{ and ending with }}) into your GitHub secret."
+                )
                 return False
 
             # Access Spreadsheet
             if self.sheet_id:
-                self.spreadsheet = self.client.open_by_key(self.sheet_id)
+                clean_id = self.sheet_id.strip()
+                # If user provided full spreadsheet URL, extract ID
+                match = re.search(r"/spreadsheets/d/([a-zA-Z0-9-_]+)", clean_id)
+                if match:
+                    clean_id = match.group(1)
+                self.spreadsheet = self.client.open_by_key(clean_id)
             elif self.sheet_name:
-                self.spreadsheet = self.client.open(self.sheet_name)
+                self.spreadsheet = self.client.open(self.sheet_name.strip())
             else:
                 logger.error("Neither GOOGLE_SHEET_ID nor GOOGLE_SHEET_NAME specified.")
                 return False
@@ -856,7 +880,11 @@ class LeadGenerationPipeline:
         logger.info("=" * 60)
 
         # Step 3.1: Connect to Google Sheets & Deduplication Memory
-        self.sheet_manager.connect()
+        connected = self.sheet_manager.connect()
+        if not self.dry_run and not connected:
+            raise RuntimeError(
+                "Failed to connect to Google Sheets! Please verify that GOOGLE_SERVICE_ACCOUNT_JSON contains the complete service account JSON and that GOOGLE_SHEET_ID is set."
+            )
         existing_domains = self.sheet_manager.get_existing_domains()
 
         # Step 3.2: Multi-Region Scraping
@@ -874,7 +902,7 @@ class LeadGenerationPipeline:
             logger.warning("No new candidates found after deduplication and email filtering.")
             return []
 
-        # Step 3.3: Llama 3.1 8B Scoring & Selection of Strict Top 10
+        # Step 3.3: GLM-5.3-Flash Scoring & Selection of Strict Top 10
         top_10 = self.evaluator.score_and_select_top_10(candidates)
 
         # Step 3.4: Cold Email Pitch Drafting
@@ -900,8 +928,13 @@ class LeadGenerationPipeline:
             final_records.append(record)
 
         # Step 3.5: Google Sheets Sync & Reporting
-        self.sheet_manager.append_lead_records(final_records)
+        appended = self.sheet_manager.append_lead_records(final_records)
         self._display_summary(final_records)
+
+        if not self.dry_run and not appended:
+            raise RuntimeError(
+                "Failed to append rows to Google Sheets! Please ensure the service account email is added as an 'Editor' to your Google Sheet."
+            )
 
         logger.info("Daily pipeline execution completed successfully.")
         return final_records
