@@ -1,4 +1,4 @@
-huggingface_hub>=0.28.0,<1.0.0
+openai>=1.0.0
 apify-client>=1.8.0,<2.0.0
 gspread>=6.0.0,<7.0.0
 oauth2client>=4.1.3

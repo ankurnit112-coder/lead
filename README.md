@@ -1,11 +1,11 @@
-# Autonomous Daily Lead Prospector & Cold Outreach Pipeline (Hugging Face Edition)
+# Autonomous Daily Lead Prospector & Cold Outreach Pipeline (NVIDIA NIM Edition)
 
-An autonomous, production-grade B2B lead generation and cold outreach pipeline powered by **Meta Llama 3.1 8B** via the **Hugging Face Inference API**, **Apify**, and **Google Sheets**.
+An autonomous, production-grade B2B lead generation and cold outreach pipeline powered by **GLM-5.3-Flash** (`z-ai/glm-5.3-flash`) via the **NVIDIA NIM API**, **Apify**, and **Google Sheets**.
 
 Every morning at **08:00 UTC**, the pipeline:
-1. **Deduplicates**: Reads historical records from Google Sheets (Column D - `Website URL`) to prevent duplicate outreach.
+1. **Deduplicates**: Reads historical records from Google Sheets (Column D - `Website URL`) to prevent duplicate outreach across past runs.
 2. **Scrapes**: Discovers 40–50 high-ticket B2B service firms daily across rotating global markets (US, UK, AU, CA, EU) with fallback email extraction.
-3. **Evaluates & Scores**: Uses `meta-llama/Llama-3.1-8B-Instruct` to audit website positioning, assigning a 1–100 quality score and classifying each prospect into `"Authority Website"` or `"AI Growth Website"`.
+3. **Evaluates & Scores**: Uses `z-ai/glm-5.3-flash` on NVIDIA NIM to audit digital positioning, assigning a 1–100 quality score and classifying each prospect into `"Authority Website"` or `"AI Growth Website"`.
 4. **Drafts Pitches**: Selects strictly the **top 10** highest-scoring leads and writes personalized, human-like cold emails (<110 words) free of AI cliches.
 5. **Syncs to Sheets**: Appends all 10 curated leads and pitches to Google Sheets (`Outreach Pipeline - Daily Top 10`) under `Status = "Pending Review"`.
 
@@ -21,7 +21,7 @@ flowchart TD
     B --> E["Step 2: Scrape Candidates via Apify Google Places Actor"]
     E --> F["Extract 40-50 Candidates & Run Fallback Email Scraper"]
     F --> G["Filter Missing Emails & Deduplicate against Seen Set"]
-    G --> H["Step 3: Llama 3.1 8B Evaluation via HF InferenceClient"]
+    G --> H["Step 3: GLM-5.3-Flash Evaluation via NVIDIA NIM API"]
     H --> I["Sort Descending by Score & Select Strict Top 10"]
     I --> J["Step 4: Draft Bespoke Cold Email (<110 words, Human Tone)"]
     J --> K["Step 5: Atomic Append to Google Sheets"]
@@ -52,11 +52,11 @@ Records are appended to the worksheet tab `Outreach Pipeline - Daily Top 10` (au
 
 ## Setup & Prerequisites
 
-### 1. Hugging Face Access & Gated Model Acceptance
-1. Create a Hugging Face account at [huggingface.co](https://huggingface.co/).
-2. Go to [Hugging Face Settings > Access Tokens](https://huggingface.co/settings/tokens) and generate a token with **Inference** permissions.
-3. Visit the model card for [meta-llama/Llama-3.1-8B-Instruct](https://huggingface.co/meta-llama/Llama-3.1-8B-Instruct).
-4. Review and accept Meta's license agreement to gain access to gated Llama 3.1 weights.
+### 1. NVIDIA NIM API Access (`z-ai/glm-5.3-flash`)
+1. Visit **[build.nvidia.com](https://build.nvidia.com/)**.
+2. Sign in with your NVIDIA account and search for **`z-ai/glm-5.3-flash`**.
+3. Click **Get API Key** to generate your `nvapi-...` key.
+4. NVIDIA NIM provides an OpenAI-compatible endpoint at `https://integrate.api.nvidia.com/v1`.
 
 ### 2. Google Cloud Service Account & Google Sheet
 1. Open the [Google Cloud Console](https://console.cloud.google.com/).
@@ -82,8 +82,8 @@ Records are appended to the worksheet tab `Outreach Pipeline - Daily Top 10` (au
 ### Installation
 ```bash
 # Clone the repository
-git clone <your-repo-url>
-cd "Lead Generator"
+git clone https://github.com/ankurnit112-coder/lead.git
+cd lead
 
 # Install dependencies
 pip install -r requirements.txt
@@ -101,12 +101,12 @@ python -m pytest tests/ -v
 ```
 
 ### Live Local Execution
-Create a local `.env` or set environment variables:
+Set your environment variables and execute:
 
 **PowerShell:**
 ```powershell
 $env:APIFY_TOKEN = "apify_api_..."
-$env:HF_TOKEN = "hf_..."
+$env:NVIDIA_API_KEY = "nvapi-..."
 $env:GOOGLE_SERVICE_ACCOUNT_JSON = Get-Content -Raw "path/to/service-account.json"
 $env:GOOGLE_SHEET_ID = "1a2b3c4d..."
 python pipeline.py
@@ -115,7 +115,7 @@ python pipeline.py
 **Bash:**
 ```bash
 export APIFY_TOKEN="apify_api_..."
-export HF_TOKEN="hf_..."
+export NVIDIA_API_KEY="nvapi-..."
 export GOOGLE_SERVICE_ACCOUNT_JSON=$(cat path/to/service-account.json)
 export GOOGLE_SHEET_ID="1a2b3c4d..."
 python pipeline.py
@@ -132,12 +132,12 @@ In your GitHub repository, navigate to **Settings > Secrets and variables > Acti
 
 | Secret Name | Required | Description |
 | :--- | :---: | :--- |
-| `HF_TOKEN` | **Yes** | Hugging Face access token with Inference permissions |
+| `NVIDIA_API_KEY` | **Yes** | NVIDIA NIM API key (`nvapi-...`) from build.nvidia.com |
 | `APIFY_TOKEN` | **Yes** | Apify API token |
 | `GOOGLE_SERVICE_ACCOUNT_JSON` | **Yes** | Complete raw JSON content of your Google Cloud Service Account key |
 | `GOOGLE_SHEET_ID` | **Yes** | Target Google Sheet ID from URL |
 | `GOOGLE_WORKSHEET_NAME` | No | Target worksheet tab (default: `Outreach Pipeline - Daily Top 10`) |
-| `HF_MODEL` | No | Model override (default: `meta-llama/Llama-3.1-8B-Instruct`) |
+| `NVIDIA_MODEL` | No | Model override (default: `z-ai/glm-5.3-flash`) |
 
 ### Triggering the Workflow
 - **Automatic**: Runs daily at `08:00 UTC` (`0 8 * * *`).
@@ -149,9 +149,9 @@ In your GitHub repository, navigate to **Settings > Secrets and variables > Acti
 
 | Variable | Default | Description |
 | :--- | :--- | :--- |
+| `NVIDIA_API_KEY` | `None` | NVIDIA NIM API key (`nvapi-...`) |
+| `NVIDIA_MODEL` | `z-ai/glm-5.3-flash` | NVIDIA NIM model identifier |
 | `APIFY_TOKEN` | `None` | Apify API access token |
-| `HF_TOKEN` | `None` | Hugging Face user token |
-| `HF_MODEL` | `meta-llama/Llama-3.1-8B-Instruct` | Hugging Face repository model ID |
 | `GOOGLE_SERVICE_ACCOUNT_JSON` | `None` | Service account JSON string or file path |
 | `GOOGLE_SHEET_ID` | `None` | Google Spreadsheet ID (from URL) |
 | `GOOGLE_SHEET_NAME` | `None` | Alternative lookup by spreadsheet name |

@@ -50,11 +50,12 @@ jobs:
       - name: Execute Lead Pipeline
         env:
           APIFY_TOKEN: ${{ secrets.APIFY_TOKEN }}
+          NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
+          NVIDIA_MODEL: ${{ secrets.NVIDIA_MODEL }}
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
           GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
           GOOGLE_WORKSHEET_NAME: ${{ secrets.GOOGLE_WORKSHEET_NAME }}
-          HF_MODEL: ${{ secrets.HF_MODEL }}
           DRY_RUN: ${{ inputs.dry_run }}
           MOCK_SCRAPE: ${{ inputs.mock_scrape }}
           NICHE_OVERRIDE: ${{ inputs.niche_override }}

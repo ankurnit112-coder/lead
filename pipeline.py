@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-Autonomous Daily Lead Prospector & Cold Outreach Pipeline (Hugging Face Edition)
+Autonomous Daily Lead Prospector & Cold Outreach Pipeline (NVIDIA GLM-5.3-Flash Edition)
 
 This pipeline:
 1. Deduplicates prospective businesses against historical records stored in Google Sheets (Column D - Website URL).
 2. Scrapes 40-50 high-ticket B2B service candidates daily via Apify across rotating global markets with fallback email extraction.
-3. Evaluates & scores candidates using meta-llama/Llama-3.1-8B-Instruct via Hugging Face InferenceClient.
+3. Evaluates & scores candidates using z-ai/glm-5.3-flash via NVIDIA NIM API (OpenAI-compatible).
 4. Selects strictly the top 10 highest-quality leads per day and drafts personalized, human-like cold emails (<110 words).
 5. Synchronizes top 10 leads to Google Sheets ('Outreach Pipeline - Daily Top 10') with Status = 'Pending Review'.
 """
@@ -36,9 +36,9 @@ if hasattr(sys.stdout, "reconfigure"):
 
 # Third-party integrations
 try:
-    from huggingface_hub import InferenceClient
+    from openai import OpenAI
 except ImportError:
-    InferenceClient = None
+    OpenAI = None
 
 try:
     from apify_client import ApifyClient
@@ -61,9 +61,19 @@ logging.basicConfig(
 logger = logging.getLogger("LeadPipeline")
 
 # Default Constants & Niches
-DEFAULT_HF_MODEL = "meta-llama/Llama-3.1-8B-Instruct"
+DEFAULT_LLM_MODEL = "z-ai/glm-5.3-flash"
+NVIDIA_NIM_BASE_URL = "https://integrate.api.nvidia.com/v1"
 DEFAULT_WORKSHEET_NAME = "Outreach Pipeline - Daily Top 10"
 DEFAULT_MAX_CANDIDATES = 50
+
+def resolve_model_name(model_name: Optional[str]) -> str:
+    """Resolves shorthand model names to full NVIDIA NIM provider format."""
+    if not model_name:
+        return DEFAULT_LLM_MODEL
+    clean = model_name.strip()
+    if clean.lower() in ("glm-5.3-flash", "glm-5-3-flash", "glm-5.3", "glm-5-3"):
+        return "z-ai/glm-5.3-flash"
+    return clean
 
 ROTATING_NICHES = [
     {"name": "Intellectual Property Law Firm", "query": "IP and patent law firm"},
@@ -586,17 +596,17 @@ class ProspectScraper:
 
 
 # ==============================================================================
-# Step 3.3: Llama 3.1 8B Scoring via Hugging Face InferenceClient
+# Step 3.3: GLM-5.3-Flash Scoring via NVIDIA NIM API
 # ==============================================================================
 
 class LeadEvaluator:
-    def __init__(self, hf_token: Optional[str] = None, model: str = DEFAULT_HF_MODEL, mock: bool = False):
-        self.hf_token = hf_token
-        self.model = model
+    def __init__(self, api_key: Optional[str] = None, model: str = DEFAULT_LLM_MODEL, mock: bool = False, **kwargs):
+        self.api_key = api_key or kwargs.get("hf_token")
+        self.model = resolve_model_name(model)
         self.mock = mock
         self.client = None
-        if hf_token and InferenceClient and not mock:
-            self.client = InferenceClient(token=hf_token)
+        if self.api_key and OpenAI and not mock:
+            self.client = OpenAI(base_url=NVIDIA_NIM_BASE_URL, api_key=self.api_key)
 
     @retry(
         wait=wait_exponential(multiplier=1, min=2, max=10),
@@ -604,27 +614,47 @@ class LeadEvaluator:
         retry=retry_if_exception_type(Exception),
         reraise=True,
     )
-    def _call_hf_inference(self, prompt: str) -> str:
+    def _call_llm_inference(self, prompt: str) -> str:
         """
-        Calls Hugging Face Inference API with automatic retries for cold-starts/rate limits.
+        Calls NVIDIA NIM API (hosting z-ai/glm-5.3-flash) with automatic retries.
         """
-        response = self.client.chat.completions.create(
-            model=self.model,
-            messages=[
-                {"role": "system", "content": "You are an expert enterprise B2B website auditor and lead scorer. Always return valid, parseable JSON."},
+        sys_prompt = "You are an expert enterprise B2B website auditor and lead scorer. Always return valid, parseable JSON."
+        if self.client:
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": sys_prompt},
+                    {"role": "user", "content": prompt},
+                ],
+                max_tokens=400,
+                temperature=0.2,
+            )
+            return response.choices[0].message.content
+
+        # Direct HTTP fallback
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": sys_prompt},
                 {"role": "user", "content": prompt},
             ],
-            max_tokens=300,
-            temperature=0.2,
-        )
-        return response.choices[0].message.content
+            "max_tokens": 400,
+            "temperature": 0.2,
+        }
+        res = requests.post(f"{NVIDIA_NIM_BASE_URL}/chat/completions", headers=headers, json=payload, timeout=30)
+        res.raise_for_status()
+        return res.json()["choices"][0]["message"]["content"]
 
     def evaluate_candidate(self, candidate: ProspectCandidate) -> LeadEvaluation:
         """
-        Evaluates a single prospect candidate using Llama 3.1 8B, categorizing into
+        Evaluates a single prospect candidate using GLM-5.3-Flash, categorizing into
         'Authority Website' vs 'AI Growth Website' and scoring from 1-100.
         """
-        if self.mock or not self.client:
+        if self.mock or (not self.client and not self.api_key):
             # Deterministic, realistic mock evaluation
             dom_hash = sum(ord(c) for c in candidate.website)
             score = 65 + (dom_hash % 33)  # Range 65 to 97
@@ -660,7 +690,7 @@ You must respond ONLY with a valid JSON object matching this schema:
   "primary_pain_point": "Outdated trust signals and lack of clear executive positioning hurting client conversion."
 }}
 """
-        raw_resp = self._call_hf_inference(prompt)
+        raw_resp = self._call_llm_inference(prompt)
         parsed = extract_json_from_llm_response(raw_resp)
         return LeadEvaluation(**parsed)
 
@@ -668,7 +698,7 @@ You must respond ONLY with a valid JSON object matching this schema:
         """
         Scores all candidates, sorts descending by score, and extracts strictly the top 10.
         """
-        logger.info(f"Evaluating {len(candidates)} candidates via Llama-3.1-8B scoring...")
+        logger.info(f"Evaluating {len(candidates)} candidates via NVIDIA GLM-5.3-Flash scoring...")
         evaluated = []
 
         for candidate in candidates:
@@ -691,13 +721,13 @@ You must respond ONLY with a valid JSON object matching this schema:
 # ==============================================================================
 
 class ColdEmailDraftsman:
-    def __init__(self, hf_token: Optional[str] = None, model: str = DEFAULT_HF_MODEL, mock: bool = False):
-        self.hf_token = hf_token
-        self.model = model
+    def __init__(self, api_key: Optional[str] = None, model: str = DEFAULT_LLM_MODEL, mock: bool = False, **kwargs):
+        self.api_key = api_key or kwargs.get("hf_token")
+        self.model = resolve_model_name(model)
         self.mock = mock
         self.client = None
-        if hf_token and InferenceClient and not mock:
-            self.client = InferenceClient(token=hf_token)
+        if self.api_key and OpenAI and not mock:
+            self.client = OpenAI(base_url=NVIDIA_NIM_BASE_URL, api_key=self.api_key)
 
     @retry(
         wait=wait_exponential(multiplier=1, min=2, max=10),
@@ -705,23 +735,40 @@ class ColdEmailDraftsman:
         retry=retry_if_exception_type(Exception),
         reraise=True,
     )
-    def _call_hf_inference(self, prompt: str) -> str:
-        response = self.client.chat.completions.create(
-            model=self.model,
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "You are an elite, senior technical growth engineer writing direct, peer-to-peer cold emails. "
-                        "Never use marketing cliches. Always return valid JSON."
-                    ),
-                },
+    def _call_llm_inference(self, prompt: str) -> str:
+        sys_prompt = (
+            "You are an elite, senior technical growth engineer writing direct, peer-to-peer cold emails. "
+            "Never use marketing cliches. Always return valid JSON."
+        )
+        if self.client:
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": sys_prompt},
+                    {"role": "user", "content": prompt},
+                ],
+                max_tokens=400,
+                temperature=0.3,
+            )
+            return response.choices[0].message.content
+
+        # Direct HTTP fallback
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": sys_prompt},
                 {"role": "user", "content": prompt},
             ],
-            max_tokens=300,
-            temperature=0.3,
-        )
-        return response.choices[0].message.content
+            "max_tokens": 400,
+            "temperature": 0.3,
+        }
+        res = requests.post(f"{NVIDIA_NIM_BASE_URL}/chat/completions", headers=headers, json=payload, timeout=30)
+        res.raise_for_status()
+        return res.json()["choices"][0]["message"]["content"]
 
     def draft_email_pitch(self, candidate: ProspectCandidate, evaluation: LeadEvaluation) -> EmailPitch:
         """
@@ -775,7 +822,7 @@ Respond ONLY with valid JSON:
   "email_body": "..."
 }}
 """
-        raw_resp = self._call_hf_inference(prompt)
+        raw_resp = self._call_llm_inference(prompt)
         parsed = extract_json_from_llm_response(raw_resp)
         return EmailPitch(**parsed)
 
@@ -797,8 +844,10 @@ class LeadGenerationPipeline:
             dry_run=self.dry_run,
         )
         self.scraper = ProspectScraper(apify_token=config.get("apify_token"), mock=self.mock)
-        self.evaluator = LeadEvaluator(hf_token=config.get("hf_token"), model=config.get("hf_model", DEFAULT_HF_MODEL), mock=self.mock)
-        self.draftsman = ColdEmailDraftsman(hf_token=config.get("hf_token"), model=config.get("hf_model", DEFAULT_HF_MODEL), mock=self.mock)
+        llm_api_key = config.get("nvidia_api_key") or config.get("hf_token")
+        llm_model = config.get("nvidia_model") or config.get("hf_model") or DEFAULT_LLM_MODEL
+        self.evaluator = LeadEvaluator(api_key=llm_api_key, model=llm_model, mock=self.mock)
+        self.draftsman = ColdEmailDraftsman(api_key=llm_api_key, model=llm_model, mock=self.mock)
 
     def run(self) -> List[FinalLeadRecord]:
         logger.info("=" * 60)
@@ -898,22 +947,35 @@ class LeadGenerationPipeline:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Autonomous Daily Lead Prospector & Cold Outreach Pipeline"
+        description="Autonomous Daily Lead Prospector & Cold Outreach Pipeline (NVIDIA NIM GLM-5.3-Flash)"
     )
     parser.add_argument("--dry-run", action="store_true", help="Run without mutating Google Sheets")
     parser.add_argument("--mock", action="store_true", help="Use mock scraping and LLM generation")
     parser.add_argument("--max-candidates", type=int, default=DEFAULT_MAX_CANDIDATES, help="Candidates to scrape")
     parser.add_argument("--niche", type=str, default=None, help="Override rotating niche")
     parser.add_argument("--region", type=str, default=None, help="Override rotating region")
-    parser.add_argument("--model", type=str, default=None, help="Override Hugging Face model")
+    parser.add_argument("--model", type=str, default=None, help=f"Override model (default: {DEFAULT_LLM_MODEL})")
+    parser.add_argument("--api-key", type=str, default=None, help="NVIDIA NIM API key")
     return parser.parse_args()
 
 
 def load_config(args: argparse.Namespace) -> Dict[str, Any]:
+    nvidia_key = (
+        args.api_key
+        or os.environ.get("NVIDIA_API_KEY")
+        or os.environ.get("NVIDIA_KEY")
+        or os.environ.get("HF_TOKEN")
+    )
+    model = (
+        args.model
+        or os.environ.get("NVIDIA_MODEL")
+        or os.environ.get("HF_MODEL")
+        or DEFAULT_LLM_MODEL
+    )
     return {
         "apify_token": os.environ.get("APIFY_TOKEN"),
-        "hf_token": os.environ.get("HF_TOKEN"),
-        "hf_model": args.model or os.environ.get("HF_MODEL") or DEFAULT_HF_MODEL,
+        "nvidia_api_key": nvidia_key,
+        "nvidia_model": resolve_model_name(model),
         "google_service_account_json": os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON"),
         "google_sheet_id": os.environ.get("GOOGLE_SHEET_ID"),
         "google_sheet_name": os.environ.get("GOOGLE_SHEET_NAME"),
