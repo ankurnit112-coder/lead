@@ -1,142 +1,168 @@
-# Autonomous Daily Lead Prospector & Cold Outreach Pipeline
+# Autonomous Daily Lead Prospector & Cold Outreach Pipeline (Hugging Face Edition)
 
-Fully autonomous daily engine that scrapes global B2B prospects via **Apify**, scores them with
-**Llama 3.1 8B Instruct via Hugging Face** (`meta-llama/Meta-Llama-3.1-8B-Instruct`), drafts bespoke <110-word cold emails,
-deduplicates against history, and logs strictly the **top 10** leads/day into Google Sheets.
-Runs at **08:00 UTC daily** via GitHub Actions.
+An autonomous, production-grade B2B lead generation and cold outreach pipeline powered by **Meta Llama 3.1 8B** via the **Hugging Face Inference API**, **Apify**, and **Google Sheets**.
 
-## How it works
+Every morning at **08:00 UTC**, the pipeline:
+1. **Deduplicates**: Reads historical records from Google Sheets (Column D - `Website URL`) to prevent duplicate outreach.
+2. **Scrapes**: Discovers 40–50 high-ticket B2B service firms daily across rotating global markets (US, UK, AU, CA, EU) with fallback email extraction.
+3. **Evaluates & Scores**: Uses `meta-llama/Llama-3.1-8B-Instruct` to audit website positioning, assigning a 1–100 quality score and classifying each prospect into `"Authority Website"` or `"AI Growth Website"`.
+4. **Drafts Pitches**: Selects strictly the **top 10** highest-scoring leads and writes personalized, human-like cold emails (<110 words) free of AI cliches.
+5. **Syncs to Sheets**: Appends all 10 curated leads and pitches to Google Sheets (`Outreach Pipeline - Daily Top 10`) under `Status = "Pending Review"`.
 
-1. **Dedup memory (Sheets first):** reads Column D (`Website URL`) from the worksheet
-   `Outreach Pipeline - Daily Top 10` into an in-memory domain set.
-2. **Multi-region scraping (Apify):** triggers `compass/crawler-google-places`
-   (overridable via `APIFY_ACTOR_ID`) across 5 rotated niche × market combos per day
-   (US, UK, AU, CA, DE, FR, NL, IE), targeting 40–50 candidates. Drops entries without a
-   valid website/email; backfills missing emails by scraping the root domain homepage +
-   `/contact` with regex. Drops anything matching the dedup set.
-3. **Fit evaluation (HF JSON mode):** each candidate → `offer_angle`
-   (`Authority Website` | `AI Growth Website`), `quality_score` 0–100, one-sentence
-   `pain_point`. Sorted descending, strictly top 10 kept.
-4. **Bespoke drafting (HF JSON mode):** per top-10 lead, peer-to-peer note
-   (<110 words, banned clichés removed, specific bottleneck → commercial cost → soft
-   Loom-preview CTA) + 3–6 word lowercase/sentence-case subject.
-5. **Sheets sync:** appends 10 rows with columns
-   `Date Added | Company Name | Country/Region | Website URL | Contact Email | Offer Angle | Quality Score | Core Pain Point | Subject Line | Custom Email Pitch | Status`
-   with `Status = "Pending Review"`.
+---
 
-One bad record never kills the batch: per-prospect try/except, exponential-backoff retries
-on Hugging Face + Apify, and strict typing/logging throughout.
+## Architecture & Data Flow
 
-## Repo layout
-
-```text
-pipeline.py                         # full pipeline (Steps 3.1–3.5)
-requirements.txt                    # pinned deps
-.github/workflows/daily_pipeline.yml  # cron 0 8 * * * + secret injection
-README.md
+```mermaid
+flowchart TD
+    A["Scheduled Trigger: 08:00 UTC (GitHub Actions)"] --> B["pipeline.py Start"]
+    B --> C["Step 1: Connect to Google Sheets & Read Column D"]
+    C --> D["In-Memory Normalized Domain Set"]
+    B --> E["Step 2: Scrape Candidates via Apify Google Places Actor"]
+    E --> F["Extract 40-50 Candidates & Run Fallback Email Scraper"]
+    F --> G["Filter Missing Emails & Deduplicate against Seen Set"]
+    G --> H["Step 3: Llama 3.1 8B Evaluation via HF InferenceClient"]
+    H --> I["Sort Descending by Score & Select Strict Top 10"]
+    I --> J["Step 4: Draft Bespoke Cold Email (<110 words, Human Tone)"]
+    J --> K["Step 5: Atomic Append to Google Sheets"]
+    K --> L["Complete (Status: Pending Review)"]
 ```
 
-## Prerequisites
+---
 
-- Python 3.11+
-- Apify account + token ([console.apify.com](https://console.apify.com) → Settings → Integrations → API tokens)
-- Hugging Face account + token ([huggingface.co/settings/tokens](https://huggingface.co/settings/tokens) → Create token with Inference permission) + access to the gated `meta-llama/Meta-Llama-3.1-8B-Instruct` model (open the model page while logged in and accept the license)
-- Google Cloud project + Service Account + a Google Sheet
-- GitHub repo to host this code
+## 11-Column Google Sheet Schema
 
-## 1. Google Cloud Service Account setup
+Records are appended to the worksheet tab `Outreach Pipeline - Daily Top 10` (auto-created if not present):
 
-1. Go to [Google Cloud Console](https://console.cloud.google.com) → create/select a project.
-2. **APIs & Services → Library:** enable **Google Sheets API** and **Google Drive API**.
-3. **IAM & Admin → Service Accounts → Create Service Account:**
-   - Name e.g. `lead-prospector`, role: none needed (least privilege).
-   - Open the account → **Keys → Add Key → Create new key → JSON** → downloads
-     `service-account.json`.
-4. Copy the `client_email` from that JSON (looks like `lead-prospector@<project>.iam.gserviceaccount.com`).
-5. Create your Google Sheet (e.g. `Lead Pipeline`), and **Share → add the `client_email`
-   as Editor**. Without this, the API gets 403/404.
-6. Get the **Spreadsheet ID** from the sheet URL:
-   `https://docs.google.com/spreadsheets/d/<SPREADSHEET_ID>/edit`.
-   The pipeline auto-creates the worksheet `Outreach Pipeline - Daily Top 10` with the
-   correct headers on first run (Column D = Website URL is the dedup key — do not reorder).
+| Column # | Column Header | Description |
+| :---: | :--- | :--- |
+| **A** | `Date Added` | Date in `YYYY-MM-DD` format |
+| **B** | `Company Name` | Business name |
+| **C** | `Country/Region` | Country code (US, UK, AU, CA, EU) |
+| **D** | `Website URL` | **Primary Deduplication Key** (Normalized in memory) |
+| **E** | `Contact Email` | Verified business contact email |
+| **F** | `Offer Angle` | `"Authority Website"` or `"AI Growth Website"` |
+| **G** | `Quality Score` | 1–100 score based on deal size and modernization urgency |
+| **H** | `Core Pain Point` | Concise 1-sentence digital bottleneck |
+| **I** | `Subject Line` | 3–6 word curiosity-driven subject line |
+| **J** | `Custom Email Pitch` | Peer-to-peer technical cold email pitch (<110 words) |
+| **K** | `Status` | Initial status: `"Pending Review"` |
 
-## 2. Local setup
+---
 
-```powershell
-# Windows PowerShell
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
+## Setup & Prerequisites
+
+### 1. Hugging Face Access & Gated Model Acceptance
+1. Create a Hugging Face account at [huggingface.co](https://huggingface.co/).
+2. Go to [Hugging Face Settings > Access Tokens](https://huggingface.co/settings/tokens) and generate a token with **Inference** permissions.
+3. Visit the model card for [meta-llama/Llama-3.1-8B-Instruct](https://huggingface.co/meta-llama/Llama-3.1-8B-Instruct).
+4. Review and accept Meta's license agreement to gain access to gated Llama 3.1 weights.
+
+### 2. Google Cloud Service Account & Google Sheet
+1. Open the [Google Cloud Console](https://console.cloud.google.com/).
+2. Create a new project (e.g. `lead-pipeline-automation`).
+3. Enable both the **Google Sheets API** and **Google Drive API** in APIs & Services.
+4. Navigate to **IAM & Admin > Service Accounts**, create a service account, and generate a **JSON key**. Download this file.
+5. Create a new Google Sheet (or open an existing one).
+6. Note the Spreadsheet ID from the URL:
+   ```
+   https://docs.google.com/spreadsheets/d/<GOOGLE_SHEET_ID>/edit
+   ```
+7. Click **Share** on your Google Sheet and add the service account's `client_email` with **Editor** permissions.
+
+### 3. Apify API Token
+1. Sign up at [apify.com](https://apify.com/).
+2. Go to **Settings > Integrations > API Tokens** and copy your token.
+3. The scraper uses the actor `compass/crawler-google-places` to extract B2B listings with root domain websites.
+
+---
+
+## Local Development & Testing
+
+### Installation
+```bash
+# Clone the repository
+git clone <your-repo-url>
+cd "Lead Generator"
+
+# Install dependencies
 pip install -r requirements.txt
+```
 
-# Set env vars (PowerShell — current session only)
+### Dry-Run & Offline Verification (No API Keys Required)
+Run the complete pipeline locally using mock data and simulated Google Sheets synchronization:
+```bash
+python pipeline.py --mock --dry-run
+```
+
+### Run Automated Unit & Integration Tests
+```bash
+python -m pytest tests/ -v
+```
+
+### Live Local Execution
+Create a local `.env` or set environment variables:
+
+**PowerShell:**
+```powershell
 $env:APIFY_TOKEN = "apify_api_..."
 $env:HF_TOKEN = "hf_..."
-$env:GOOGLE_SHEET_ID = "<SPREADSHEET_ID>"
-# Entire JSON file content as a single-line string:
-$env:GOOGLE_SERVICE_ACCOUNT_JSON = (Get-Content -Raw service-account.json)
-
-# Optional overrides
-$env:GOOGLE_WORKSHEET_NAME = "Outreach Pipeline - Daily Top 10"
-$env:APIFY_ACTOR_ID = "compass/crawler-google-places"
-$env:HF_MODEL = "meta-llama/Meta-Llama-3.1-8B-Instruct"
-$env:MAX_CANDIDATES = "50"
-
+$env:GOOGLE_SERVICE_ACCOUNT_JSON = Get-Content -Raw "path/to/service-account.json"
+$env:GOOGLE_SHEET_ID = "1a2b3c4d..."
 python pipeline.py
 ```
 
-Dry run (no Sheets write, prints rows to stdout — useful before sharing the sheet):
-
-```powershell
-$env:DRY_RUN = "true"
-python pipeline.py
-```
-
-Bash equivalent:
-
+**Bash:**
 ```bash
-export APIFY_TOKEN="apify_api_..." HF_TOKEN="hf_..." GOOGLE_SHEET_ID="<ID>"
-export GOOGLE_SERVICE_ACCOUNT_JSON="$(cat service-account.json)"
+export APIFY_TOKEN="apify_api_..."
+export HF_TOKEN="hf_..."
+export GOOGLE_SERVICE_ACCOUNT_JSON=$(cat path/to/service-account.json)
+export GOOGLE_SHEET_ID="1a2b3c4d..."
 python pipeline.py
 ```
 
-## 3. Deploy to GitHub (scheduled daily run)
+---
 
-1. Push these files to a GitHub repo.
-2. **Repo → Settings → Secrets and variables → Actions → New repository secret**, add:
-   | Secret | Value |
-   |---|---|
-   | `APIFY_TOKEN` | your Apify token |
-   | `HF_TOKEN` | your Hugging Face token (with Inference access) |
-   | `GOOGLE_SERVICE_ACCOUNT_JSON` | full contents of `service-account.json` (raw JSON, not a path) |
-   | `GOOGLE_SHEET_ID` | spreadsheet ID from the URL |
-   | `GOOGLE_WORKSHEET_NAME` _(optional)_ | defaults to `Outreach Pipeline - Daily Top 10` |
-   | `APIFY_ACTOR_ID` _(optional)_ | defaults to `compass/crawler-google-places` |
-3. The workflow `.github/workflows/daily_pipeline.yml` is already configured with
-   `schedule: cron '0 8 * * *'` (08:00 UTC daily) plus `workflow_dispatch` for manual runs.
-4. Test: **Actions tab → Daily Lead Prospector → Run workflow**, then check the new
-   10 rows in your sheet.
-5. Note: GitHub disables scheduled workflows after 60 days of repo inactivity — trigger a
-   manual run or push to re-enable.
+## GitHub Actions Automated Deployment
 
-## Environment variable reference
+The repository includes a production workflow configured at `.github/workflows/daily_pipeline.yml`.
 
-| Var | Required | Default | Purpose |
-|---|---|---|---|
-| `APIFY_TOKEN` | yes | — | Apify API auth |
-| `HF_TOKEN` | yes | — | Hugging Face/LLM auth |
-| `GOOGLE_SERVICE_ACCOUNT_JSON` | yes (unless `DRY_RUN`) | — | Service-account JSON string |
-| `GOOGLE_SHEET_ID` | yes (unless `DRY_RUN`) | — | Target spreadsheet (or set `GOOGLE_SHEET_NAME`) |
-| `GOOGLE_SHEET_NAME` | alt to ID | — | Spreadsheet title fallback |
-| `GOOGLE_WORKSHEET_NAME` | no | `Outreach Pipeline - Daily Top 10` | Worksheet tab |
-| `APIFY_ACTOR_ID` | no | `compass/crawler-google-places` | Scraper actor |
-| `HF_MODEL` | no | `meta-llama/Meta-Llama-3.1-8B-Instruct` | Scoring/drafting model |
-| `MAX_CANDIDATES` | no | `50` | Scrape batch size |
-| `DRY_RUN` | no | `false` | `true` = skip Sheets write |
+### Configure GitHub Secrets
+In your GitHub repository, navigate to **Settings > Secrets and variables > Actions** and add the following repository secrets:
 
-## Notes & limits
+| Secret Name | Required | Description |
+| :--- | :---: | :--- |
+| `HF_TOKEN` | **Yes** | Hugging Face access token with Inference permissions |
+| `APIFY_TOKEN` | **Yes** | Apify API token |
+| `GOOGLE_SERVICE_ACCOUNT_JSON` | **Yes** | Complete raw JSON content of your Google Cloud Service Account key |
+| `GOOGLE_SHEET_ID` | **Yes** | Target Google Sheet ID from URL |
+| `GOOGLE_WORKSHEET_NAME` | No | Target worksheet tab (default: `Outreach Pipeline - Daily Top 10`) |
+| `HF_MODEL` | No | Model override (default: `meta-llama/Llama-3.1-8B-Instruct`) |
 
-- Llama calls always use `response_format={"type": "json_object"}` to avoid markdown breakage.
-- The Meta Llama 3.1 model on Hugging Face is gated: you must accept its license while logged in, otherwise inference returns 403/404.
-- Apify actor input includes `scrapeContacts/scrapeEmails`; email backfill is best-effort
-  homepage scraping — expect some candidates to be dropped for missing emails (by design).
-- Never commit `service-account.json` or keys — secrets live only in env vars / GitHub Secrets.
+### Triggering the Workflow
+- **Automatic**: Runs daily at `08:00 UTC` (`0 8 * * *`).
+- **Manual**: Navigate to **Actions > Daily Lead Prospector & Cold Outreach Pipeline > Run workflow**. You can pass parameters such as `dry_run=true` or test with `mock_scrape=true`.
+
+---
+
+## Environment Variables Reference
+
+| Variable | Default | Description |
+| :--- | :--- | :--- |
+| `APIFY_TOKEN` | `None` | Apify API access token |
+| `HF_TOKEN` | `None` | Hugging Face user token |
+| `HF_MODEL` | `meta-llama/Llama-3.1-8B-Instruct` | Hugging Face repository model ID |
+| `GOOGLE_SERVICE_ACCOUNT_JSON` | `None` | Service account JSON string or file path |
+| `GOOGLE_SHEET_ID` | `None` | Google Spreadsheet ID (from URL) |
+| `GOOGLE_SHEET_NAME` | `None` | Alternative lookup by spreadsheet name |
+| `GOOGLE_WORKSHEET_NAME` | `Outreach Pipeline - Daily Top 10` | Specific tab name within spreadsheet |
+| `MAX_CANDIDATES` | `50` | Maximum candidate businesses to scrape per run |
+| `DRY_RUN` | `false` | When `true`, logs tabular output without modifying Google Sheets |
+| `MOCK_SCRAPE` | `false` | When `true`, uses mock scraper and offline deterministic scoring |
+| `NICHE_OVERRIDE` | `None` | Overrides daily rotating niche |
+| `REGION_OVERRIDE` | `None` | Overrides daily rotating target region |
+
+---
+
+## License
+MIT License.
