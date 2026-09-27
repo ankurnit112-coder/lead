@@ -245,18 +245,18 @@ def extract_json_from_llm_response(text: str) -> Dict[str, Any]:
 def extract_emails_from_text(text: str) -> List[str]:
     """
     Extracts candidate email addresses from raw text using regex,
-    filtering out image extensions, common script noise, and dummy domains.
+    filtering out image extensions, common script noise, dummy domains, and npm package versions.
     """
     if not text:
         return []
 
-    # Standard RFC-compliant relaxed email regex
-    pattern = r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+"
+    # Standard email regex requiring alphabetic TLD (avoids numeric version packages like @11.7.10)
+    pattern = r"\b[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+(?:\.[a-zA-Z0-9-]+)*\.[a-zA-Z]{2,10}\b"
     matches = re.findall(pattern, text)
 
     valid_emails = []
     ignored_extensions = (".png", ".jpg", ".jpeg", ".svg", ".webp", ".gif", ".css", ".js", ".html")
-    ignored_substrings = ("sentry", "example.com", "wixpress", "schema.org", "domain.com", "placeholder")
+    ignored_substrings = ("sentry", "example.com", "wixpress", "schema.org", "domain.com", "placeholder", "segmenter", "node_modules")
 
     for email in matches:
         email = email.strip().lower()
@@ -266,9 +266,12 @@ def extract_emails_from_text(text: str) -> List[str]:
             continue
         # Avoid malformed trailing dots
         email = email.rstrip(".")
-        if email and "@" in email and "." in email.split("@")[-1]:
-            if email not in valid_emails:
-                valid_emails.append(email)
+        if email and "@" in email:
+            domain_part = email.split("@")[-1]
+            tld = domain_part.split(".")[-1]
+            if tld.isalpha() and len(tld) >= 2:
+                if email not in valid_emails:
+                    valid_emails.append(email)
 
     return valid_emails
 
@@ -397,13 +400,34 @@ class GoogleSheetSyncManager:
                 logger.error("Neither GOOGLE_SHEET_ID nor GOOGLE_SHEET_NAME specified.")
                 return False
 
+            # Ensure clean worksheet name
+            target_ws = (self.worksheet_name or "").strip()
+            self.worksheet_name = target_ws if target_ws else DEFAULT_WORKSHEET_NAME
+
             # Access or Create Worksheet tab
             try:
                 self.worksheet = self.spreadsheet.worksheet(self.worksheet_name)
             except gspread.WorksheetNotFound:
-                logger.info(f"Worksheet '{self.worksheet_name}' not found. Creating it with default headers...")
-                self.worksheet = self.spreadsheet.add_worksheet(title=self.worksheet_name, rows=500, cols=20)
-                self.worksheet.append_row(SHEET_HEADERS)
+                # If target tab doesn't exist, check existing sheets in workbook
+                existing_sheets = self.spreadsheet.worksheets()
+                reusable = None
+                for s in existing_sheets:
+                    if s.title.lower().strip() in ("sheet1", "sheet 1"):
+                        vals = s.get_all_values()
+                        if len(vals) <= 1:
+                            reusable = s
+                            break
+
+                if reusable:
+                    logger.info(f"Target tab '{self.worksheet_name}' not found, but empty default tab '{reusable.title}' exists. Using '{reusable.title}'...")
+                    self.worksheet = reusable
+                    self.worksheet_name = reusable.title
+                    if not reusable.get_all_values():
+                        self.worksheet.append_row(SHEET_HEADERS)
+                else:
+                    logger.info(f"Worksheet '{self.worksheet_name}' not found. Creating it with default headers...")
+                    self.worksheet = self.spreadsheet.add_worksheet(title=self.worksheet_name, rows=500, cols=20)
+                    self.worksheet.append_row(SHEET_HEADERS)
 
             logger.info(f"Successfully connected to Google Sheet '{self.spreadsheet.title}', tab '{self.worksheet_name}'.")
             return True
@@ -989,6 +1013,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--region", type=str, default=None, help="Override rotating region")
     parser.add_argument("--model", type=str, default=None, help=f"Override model (default: {DEFAULT_LLM_MODEL})")
     parser.add_argument("--api-key", type=str, default=None, help="NVIDIA NIM API key")
+    parser.add_argument("--worksheet", type=str, default=None, help=f"Target worksheet tab (default: {DEFAULT_WORKSHEET_NAME})")
     return parser.parse_args()
 
 
@@ -1005,6 +1030,8 @@ def load_config(args: argparse.Namespace) -> Dict[str, Any]:
         or os.environ.get("HF_MODEL")
         or DEFAULT_LLM_MODEL
     )
+    ws_env = (os.environ.get("GOOGLE_WORKSHEET_NAME") or "").strip()
+    target_worksheet = getattr(args, "worksheet", None) or ws_env or DEFAULT_WORKSHEET_NAME
     return {
         "apify_token": os.environ.get("APIFY_TOKEN"),
         "nvidia_api_key": nvidia_key,
@@ -1012,7 +1039,7 @@ def load_config(args: argparse.Namespace) -> Dict[str, Any]:
         "google_service_account_json": os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON"),
         "google_sheet_id": os.environ.get("GOOGLE_SHEET_ID"),
         "google_sheet_name": os.environ.get("GOOGLE_SHEET_NAME"),
-        "google_worksheet_name": os.environ.get("GOOGLE_WORKSHEET_NAME", DEFAULT_WORKSHEET_NAME),
+        "google_worksheet_name": target_worksheet,
         "max_candidates": args.max_candidates or int(os.environ.get("MAX_CANDIDATES", DEFAULT_MAX_CANDIDATES)),
         "dry_run": args.dry_run or (os.environ.get("DRY_RUN", "").lower() in ("true", "1", "yes")),
         "mock": args.mock or (os.environ.get("MOCK_SCRAPE", "").lower() in ("true", "1", "yes")),

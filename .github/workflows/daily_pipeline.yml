@@ -26,6 +26,11 @@ on:
         required: false
         default: ''
         type: string
+      worksheet_override:
+        description: 'Target worksheet tab name (default: Sheet1)'
+        required: false
+        default: ''
+        type: string
 
 jobs:
   run-pipeline:
@@ -55,7 +60,7 @@ jobs:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
           GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
-          GOOGLE_WORKSHEET_NAME: ${{ secrets.GOOGLE_WORKSHEET_NAME }}
+          GOOGLE_WORKSHEET_NAME: ${{ inputs.worksheet_override || secrets.GOOGLE_WORKSHEET_NAME || 'Sheet1' }}
           DRY_RUN: ${{ inputs.dry_run }}
           MOCK_SCRAPE: ${{ inputs.mock_scrape }}
           NICHE_OVERRIDE: ${{ inputs.niche_override }}
