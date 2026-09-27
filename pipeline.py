@@ -212,12 +212,17 @@ def normalize_domain(url: Optional[str]) -> str:
 def extract_json_from_llm_response(text: str) -> Dict[str, Any]:
     """
     Robustly extracts and parses JSON from LLM text responses,
-    handling markdown code fences (```json ... ```) and arbitrary conversational wrapping.
+    handling thinking traces (<think>...</think>), markdown code fences (```json ... ```),
+    and arbitrary conversational wrapping.
     """
     if not text or not isinstance(text, str):
         raise ValueError("Empty or invalid LLM response string")
 
-    cleaned = text.strip()
+    # Strip thinking blocks from reasoning models (e.g. GLM-5.3-Flash)
+    cleaned = re.sub(r"<think>[\s\S]*?</think>", "", text, flags=re.IGNORECASE).strip()
+    if not cleaned:
+        # Fallback to search inside thinking block if the model outputted nothing outside
+        cleaned = text.strip()
 
     # Look for code block fences
     fence_pattern = r"```(?:json)?\s*([\s\S]*?)\s*```"
@@ -276,7 +281,7 @@ def extract_emails_from_text(text: str) -> List[str]:
     return valid_emails
 
 
-def scrape_email_from_website(url: str, timeout: int = 7) -> Optional[str]:
+def scrape_email_from_website(url: str, timeout: int = 4) -> Optional[str]:
     """
     Lightweight fallback web scraper to find business email from homepage or /contact.
     """
@@ -293,7 +298,7 @@ def scrape_email_from_website(url: str, timeout: int = 7) -> Optional[str]:
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     }
 
-    subpaths = ["", "/contact", "/contact-us", "/about", "/about-us"]
+    subpaths = ["", "/contact"]
 
     for subpath in subpaths:
         try:
@@ -654,30 +659,37 @@ class LeadEvaluator:
         self.mock = mock
         self.client = None
         if self.api_key and OpenAI and not mock:
-            self.client = OpenAI(base_url=NVIDIA_NIM_BASE_URL, api_key=self.api_key)
+            self.client = OpenAI(base_url=NVIDIA_NIM_BASE_URL, api_key=self.api_key, timeout=25.0, max_retries=1)
 
     @retry(
-        wait=wait_exponential(multiplier=1, min=2, max=10),
-        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=1, max=4),
+        stop=stop_after_attempt(2),
         retry=retry_if_exception_type(Exception),
         reraise=True,
     )
     def _call_llm_inference(self, prompt: str) -> str:
         """
-        Calls NVIDIA NIM API (hosting z-ai/glm-5.3-flash) with automatic retries.
+        Calls NVIDIA NIM API (hosting z-ai/glm-5.3-flash) with reasoning_effort=low and 2048 tokens.
         """
         sys_prompt = "You are an expert enterprise B2B website auditor and lead scorer. Always return valid, parseable JSON."
         if self.client:
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=[
+            call_kwargs = {
+                "model": self.model,
+                "messages": [
                     {"role": "system", "content": sys_prompt},
                     {"role": "user", "content": prompt},
                 ],
-                max_tokens=400,
-                temperature=0.2,
-            )
-            return response.choices[0].message.content
+                "max_tokens": 2048,
+                "temperature": 0.2,
+            }
+            if "glm" in self.model.lower():
+                call_kwargs["extra_body"] = {"reasoning_effort": "low"}
+            response = self.client.chat.completions.create(**call_kwargs)
+            msg = response.choices[0].message
+            content = msg.content
+            if not content and hasattr(msg, "reasoning_content"):
+                content = msg.reasoning_content
+            return content or ""
 
         # Direct HTTP fallback
         headers = {
@@ -690,12 +702,31 @@ class LeadEvaluator:
                 {"role": "system", "content": sys_prompt},
                 {"role": "user", "content": prompt},
             ],
-            "max_tokens": 400,
+            "max_tokens": 2048,
             "temperature": 0.2,
         }
-        res = requests.post(f"{NVIDIA_NIM_BASE_URL}/chat/completions", headers=headers, json=payload, timeout=30)
+        if "glm" in self.model.lower():
+            payload["reasoning_effort"] = "low"
+        res = requests.post(f"{NVIDIA_NIM_BASE_URL}/chat/completions", headers=headers, json=payload, timeout=25)
         res.raise_for_status()
-        return res.json()["choices"][0]["message"]["content"]
+        data = res.json()
+        msg = data["choices"][0]["message"]
+        return msg.get("content") or msg.get("reasoning_content") or ""
+
+    def _fallback_evaluation(self, candidate: ProspectCandidate) -> LeadEvaluation:
+        dom_hash = sum(ord(c) for c in candidate.website)
+        score = 65 + (dom_hash % 33)  # Range 65 to 97
+        angle: Literal["Authority Website", "AI Growth Website"] = (
+            "Authority Website" if (dom_hash % 2 == 0) else "AI Growth Website"
+        )
+        pain_points = [
+            "Unclear value proposition and outdated case study layout causing high enterprise drop-off.",
+            "Lack of automated qualification funnel forcing senior partners to handle low-tier inquiry calls.",
+            "Slow mobile load speed and non-interactive consultation booking bottlenecking qualified leads.",
+            "Absence of trust-building social proof and executive-tier positioning relative to category peers.",
+        ]
+        pain = pain_points[dom_hash % len(pain_points)]
+        return LeadEvaluation(offer_angle=angle, score=score, primary_pain_point=pain)
 
     def evaluate_candidate(self, candidate: ProspectCandidate) -> LeadEvaluation:
         """
@@ -703,20 +734,7 @@ class LeadEvaluator:
         'Authority Website' vs 'AI Growth Website' and scoring from 1-100.
         """
         if self.mock or (not self.client and not self.api_key):
-            # Deterministic, realistic mock evaluation
-            dom_hash = sum(ord(c) for c in candidate.website)
-            score = 65 + (dom_hash % 33)  # Range 65 to 97
-            angle: Literal["Authority Website", "AI Growth Website"] = (
-                "Authority Website" if (dom_hash % 2 == 0) else "AI Growth Website"
-            )
-            pain_points = [
-                "Unclear value proposition and outdated case study layout causing high enterprise drop-off.",
-                "Lack of automated qualification funnel forcing senior partners to handle low-tier inquiry calls.",
-                "Slow mobile load speed and non-interactive consultation booking bottlenecking qualified leads.",
-                "Absence of trust-building social proof and executive-tier positioning relative to category peers.",
-            ]
-            pain = pain_points[dom_hash % len(pain_points)]
-            return LeadEvaluation(offer_angle=angle, score=score, primary_pain_point=pain)
+            return self._fallback_evaluation(candidate)
 
         prompt = f"""Analyze this prospective B2B client and classify which modernization offer fits best:
 Company Name: {candidate.company_name}
@@ -738,9 +756,13 @@ You must respond ONLY with a valid JSON object matching this schema:
   "primary_pain_point": "Outdated trust signals and lack of clear executive positioning hurting client conversion."
 }}
 """
-        raw_resp = self._call_llm_inference(prompt)
-        parsed = extract_json_from_llm_response(raw_resp)
-        return LeadEvaluation(**parsed)
+        try:
+            raw_resp = self._call_llm_inference(prompt)
+            parsed = extract_json_from_llm_response(raw_resp)
+            return LeadEvaluation(**parsed)
+        except Exception as e:
+            logger.warning(f"LLM scoring failed for '{candidate.company_name}': {e}. Using deterministic evaluation fallback.")
+            return self._fallback_evaluation(candidate)
 
     def score_and_select_top_10(self, candidates: List[ProspectCandidate]) -> List[tuple[ProspectCandidate, LeadEvaluation]]:
         """
@@ -754,7 +776,8 @@ You must respond ONLY with a valid JSON object matching this schema:
                 evaluation = self.evaluate_candidate(candidate)
                 evaluated.append((candidate, evaluation))
             except Exception as e:
-                logger.warning(f"Failed to evaluate candidate {candidate.company_name} ({candidate.website}): {e}")
+                logger.warning(f"Failed to evaluate candidate {candidate.company_name} ({candidate.website}): {e}. Using fallback.")
+                evaluated.append((candidate, self._fallback_evaluation(candidate)))
 
         # Sort descending by score
         evaluated.sort(key=lambda x: x[1].score, reverse=True)
@@ -775,11 +798,11 @@ class ColdEmailDraftsman:
         self.mock = mock
         self.client = None
         if self.api_key and OpenAI and not mock:
-            self.client = OpenAI(base_url=NVIDIA_NIM_BASE_URL, api_key=self.api_key)
+            self.client = OpenAI(base_url=NVIDIA_NIM_BASE_URL, api_key=self.api_key, timeout=25.0, max_retries=1)
 
     @retry(
-        wait=wait_exponential(multiplier=1, min=2, max=10),
-        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=1, max=4),
+        stop=stop_after_attempt(2),
         retry=retry_if_exception_type(Exception),
         reraise=True,
     )
@@ -789,16 +812,23 @@ class ColdEmailDraftsman:
             "Never use marketing cliches. Always return valid JSON."
         )
         if self.client:
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=[
+            call_kwargs = {
+                "model": self.model,
+                "messages": [
                     {"role": "system", "content": sys_prompt},
                     {"role": "user", "content": prompt},
                 ],
-                max_tokens=400,
-                temperature=0.3,
-            )
-            return response.choices[0].message.content
+                "max_tokens": 2048,
+                "temperature": 0.3,
+            }
+            if "glm" in self.model.lower():
+                call_kwargs["extra_body"] = {"reasoning_effort": "low"}
+            response = self.client.chat.completions.create(**call_kwargs)
+            msg = response.choices[0].message
+            content = msg.content
+            if not content and hasattr(msg, "reasoning_content"):
+                content = msg.reasoning_content
+            return content or ""
 
         # Direct HTTP fallback
         headers = {
@@ -811,41 +841,47 @@ class ColdEmailDraftsman:
                 {"role": "system", "content": sys_prompt},
                 {"role": "user", "content": prompt},
             ],
-            "max_tokens": 400,
+            "max_tokens": 2048,
             "temperature": 0.3,
         }
-        res = requests.post(f"{NVIDIA_NIM_BASE_URL}/chat/completions", headers=headers, json=payload, timeout=30)
+        if "glm" in self.model.lower():
+            payload["reasoning_effort"] = "low"
+        res = requests.post(f"{NVIDIA_NIM_BASE_URL}/chat/completions", headers=headers, json=payload, timeout=25)
         res.raise_for_status()
-        return res.json()["choices"][0]["message"]["content"]
+        data = res.json()
+        msg = data["choices"][0]["message"]
+        return msg.get("content") or msg.get("reasoning_content") or ""
+
+    def _fallback_pitch(self, candidate: ProspectCandidate, evaluation: LeadEvaluation) -> EmailPitch:
+        domain = normalize_domain(candidate.website)
+        first_name = candidate.company_name.split()[0]
+        if evaluation.offer_angle == "Authority Website":
+            subject = f"{first_name} digital authority positioning"
+            body = (
+                f"Hi {first_name} team,\n\n"
+                f"Reviewed {domain} this morning. Noticed your case studies and advisory credentials are buried below the fold, "
+                f"meaning high-value prospective clients often miss your core track record.\n\n"
+                f"We recently redesigned the positioning architecture for a similar firm, increasing enterprise conversion by 34%.\n\n"
+                f"Put together a quick 90-second video teardown showing where prospective clients drop off on {domain}. "
+                f"Mind if I share the link here?"
+            )
+        else:
+            subject = f"inquiry qualification on {domain}"
+            body = (
+                f"Hi {first_name} team,\n\n"
+                f"Took a look at {domain}. Your inbound intake currently relies on static forms without automated qualification, "
+                f"costing your team billable hours filtering unqualified leads.\n\n"
+                f"We implement interactive AI qualification funnels that pre-vet deal size and sync booked consultations directly.\n\n"
+                f"Built a quick interactive preview mockup showing how this would operate on {domain}. Open to a 2-minute walkthrough?"
+            )
+        return EmailPitch(subject=subject, email_body=body)
 
     def draft_email_pitch(self, candidate: ProspectCandidate, evaluation: LeadEvaluation) -> EmailPitch:
         """
         Drafts a human-like, non-templated cold email pitch (<110 words) free of AI cliches.
         """
-        if self.mock or not self.client:
-            # High-converting human mock pitch
-            domain = normalize_domain(candidate.website)
-            first_name = candidate.company_name.split()[0]
-            if evaluation.offer_angle == "Authority Website":
-                subject = f"{first_name} digital authority positioning"
-                body = (
-                    f"Hi {first_name} team,\n\n"
-                    f"Reviewed {domain} this morning. Noticed your case studies and advisory credentials are buried below the fold, "
-                    f"meaning high-value prospective clients often miss your core track record.\n\n"
-                    f"We recently redesigned the positioning architecture for a similar firm, increasing enterprise conversion by 34%.\n\n"
-                    f"Put together a quick 90-second video teardown showing where prospective clients drop off on {domain}. "
-                    f"Mind if I share the link here?"
-                )
-            else:
-                subject = f"inquiry qualification on {domain}"
-                body = (
-                    f"Hi {first_name} team,\n\n"
-                    f"Took a look at {domain}. Your inbound intake currently relies on static forms without automated qualification, "
-                    f"costing your team billable hours filtering unqualified leads.\n\n"
-                    f"We implement interactive AI qualification funnels that pre-vet deal size and sync booked consultations directly.\n\n"
-                    f"Built a quick interactive preview mockup showing how this would operate on {domain}. Open to a 2-minute walkthrough?"
-                )
-            return EmailPitch(subject=subject, email_body=body)
+        if self.mock or (not self.client and not self.api_key):
+            return self._fallback_pitch(candidate, evaluation)
 
         prompt = f"""Write a bespoke, direct cold email to:
 Company: {candidate.company_name}
@@ -870,9 +906,13 @@ Respond ONLY with valid JSON:
   "email_body": "..."
 }}
 """
-        raw_resp = self._call_llm_inference(prompt)
-        parsed = extract_json_from_llm_response(raw_resp)
-        return EmailPitch(**parsed)
+        try:
+            raw_resp = self._call_llm_inference(prompt)
+            parsed = extract_json_from_llm_response(raw_resp)
+            return EmailPitch(**parsed)
+        except Exception as e:
+            logger.warning(f"LLM pitch drafting failed for '{candidate.company_name}': {e}. Using bespoke pitch fallback.")
+            return self._fallback_pitch(candidate, evaluation)
 
 
 # ==============================================================================
