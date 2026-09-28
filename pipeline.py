@@ -247,43 +247,204 @@ def extract_json_from_llm_response(text: str) -> Dict[str, Any]:
     raise ValueError(f"Could not parse valid JSON from text: {text[:200]}...")
 
 
+DISALLOWED_EMAIL_USERNAMES: Set[str] = {
+    "you",
+    "yourname",
+    "username",
+    "user",
+    "name",
+    "firstname",
+    "lastname",
+    "email",
+    "test",
+    "demo",
+    "sample",
+    "placeholder",
+    "admin",
+    "webmaster",
+    "postmaster",
+}
+
+DISALLOWED_EMAIL_DOMAINS: Set[str] = {
+    "company.com",
+    "yourcompany.com",
+    "example.com",
+    "domain.com",
+    "sitename.com",
+    "website.com",
+    "mycompany.com",
+    "placeholder.com",
+    "test.com",
+    "sample.com",
+    "wixpress.com",
+    "sentry.io",
+    "schema.org",
+}
+
+BANNED_BUZZWORDS: List[str] = [
+    "digital conversion architecture",
+    "institutional-grade credibility markers",
+    "prestige-tier conversion positioning",
+    "positioning architecture",
+    "digital authority funnels",
+    "unlock",
+    "delve",
+    "synergy",
+    "game-changer",
+]
+
+TIER_1_PREFIXES: Set[str] = {
+    "partner",
+    "founder",
+    "principal",
+    "director",
+    "managingpartner",
+    "managing-partner",
+    "attorney",
+    "counsel",
+    "ceo",
+    "growth",
+    "president",
+    "owner",
+    "coo",
+    "cto",
+    "cfo",
+}
+
+TIER_2_PREFIXES: Set[str] = {
+    "inquiries",
+    "inquiry",
+    "contact",
+    "contactus",
+    "hello",
+    "office",
+    "info",
+    "intake",
+    "connect",
+    "team",
+    "welcome",
+}
+
+TIER_3_PREFIXES: Set[str] = {
+    "support",
+    "help",
+    "desk",
+    "helpdesk",
+    "billing",
+    "jobs",
+    "service",
+    "careers",
+    "customerservice",
+}
+
+
+def is_valid_contact_email(email: Optional[str], company_domain: Optional[str] = None) -> bool:
+    """
+    Validates deliverability format and strictly filters out placeholder, dummy, or script emails.
+    Rejects disallowed usernames (e.g. you, username, name), placeholder domains (e.g. company.com, example.com),
+    and image/script extensions.
+    """
+    if not email or not isinstance(email, str):
+        return False
+
+    email = email.strip().lower().rstrip(".")
+    if not email or "@" not in email:
+        return False
+
+    pattern = r"^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+(?:\.[a-zA-Z0-9-]+)*\.[a-zA-Z]{2,10}$"
+    if not re.match(pattern, email):
+        return False
+
+    ignored_extensions = (".png", ".jpg", ".jpeg", ".svg", ".webp", ".gif", ".css", ".js", ".html")
+    if any(email.endswith(ext) for ext in ignored_extensions):
+        return False
+
+    ignored_substrings = ("sentry", "wixpress", "schema.org", "placeholder", "segmenter", "node_modules")
+    if any(sub in email for sub in ignored_substrings):
+        return False
+
+    parts = email.split("@")
+    if len(parts) != 2:
+        return False
+    username, domain = parts[0], parts[1]
+
+    if username in DISALLOWED_EMAIL_USERNAMES:
+        return False
+
+    if domain in DISALLOWED_EMAIL_DOMAINS:
+        return False
+
+    if any(domain == d or domain.endswith("." + d) for d in DISALLOWED_EMAIL_DOMAINS):
+        return False
+
+    if company_domain:
+        norm_company = normalize_domain(company_domain)
+        if norm_company and username in DISALLOWED_EMAIL_USERNAMES:
+            return False
+
+    return True
+
+
+def rank_email_address(email: Optional[str], company_domain: Optional[str] = None) -> int:
+    """
+    Ranks email address into deliverability and relevance tiers:
+    - Tier 1 (100): Direct / High Priority (partner, founder, principal, attorney, director, CEO, or personal name format)
+    - Tier 2 (70): Client Inquiry / General Intake (inquiries, contact, hello, office, info, intake)
+    - Tier 3 (30): Generic Desk / Ticketing (support, help, desk, billing, jobs, service)
+    - Default (50): Other valid addresses
+    """
+    if not email or not isinstance(email, str) or "@" not in email:
+        return 0
+
+    clean_email = email.strip().lower().rstrip(".")
+    username = clean_email.split("@")[0]
+    clean_user = re.sub(r"[0-9_.-]", "", username)
+
+    # Tier 1 checks
+    if username in TIER_1_PREFIXES or clean_user in TIER_1_PREFIXES:
+        return 100
+
+    # Personal name format: first.last, first_last, first-last (e.g. john.smith, sarah-connor)
+    if re.match(r"^[a-z]{2,}[._-][a-z]{2,}$", username):
+        return 100
+
+    # Tier 2 checks
+    if username in TIER_2_PREFIXES or clean_user in TIER_2_PREFIXES:
+        return 70
+
+    # Tier 3 checks
+    if username in TIER_3_PREFIXES or clean_user in TIER_3_PREFIXES:
+        return 30
+
+    return 50
+
+
 def extract_emails_from_text(text: str) -> List[str]:
     """
     Extracts candidate email addresses from raw text using regex,
-    filtering out image extensions, common script noise, dummy domains, and npm package versions.
+    filtering out image extensions, common script noise, dummy domains, and disallowed placeholders.
     """
     if not text:
         return []
 
-    # Standard email regex requiring alphabetic TLD (avoids numeric version packages like @11.7.10)
     pattern = r"\b[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+(?:\.[a-zA-Z0-9-]+)*\.[a-zA-Z]{2,10}\b"
     matches = re.findall(pattern, text)
 
     valid_emails = []
-    ignored_extensions = (".png", ".jpg", ".jpeg", ".svg", ".webp", ".gif", ".css", ".js", ".html")
-    ignored_substrings = ("sentry", "example.com", "wixpress", "schema.org", "domain.com", "placeholder", "segmenter", "node_modules")
-
     for email in matches:
-        email = email.strip().lower()
-        if any(email.endswith(ext) for ext in ignored_extensions):
-            continue
-        if any(sub in email for sub in ignored_substrings):
-            continue
-        # Avoid malformed trailing dots
-        email = email.rstrip(".")
-        if email and "@" in email:
-            domain_part = email.split("@")[-1]
-            tld = domain_part.split(".")[-1]
-            if tld.isalpha() and len(tld) >= 2:
-                if email not in valid_emails:
-                    valid_emails.append(email)
+        email = email.strip().lower().rstrip(".")
+        if is_valid_contact_email(email):
+            if email not in valid_emails:
+                valid_emails.append(email)
 
     return valid_emails
 
 
 def scrape_email_from_website(url: str, timeout: int = 4) -> Optional[str]:
     """
-    Lightweight fallback web scraper to find business email from homepage or /contact.
+    Enhanced multi-page website email scraper inspecting homepage, contact, about,
+    team, leadership, and attorneys subpages.
+    Filters candidate emails via is_valid_contact_email and returns the highest-ranked email.
     """
     if not url:
         return None
@@ -293,36 +454,65 @@ def scrape_email_from_website(url: str, timeout: int = 4) -> Optional[str]:
     else:
         target_url = url
 
+    domain = normalize_domain(target_url)
+
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     }
 
-    subpaths = ["", "/contact"]
+    subpaths = [
+        "",
+        "/contact",
+        "/contact-us",
+        "/about",
+        "/about-us",
+        "/team",
+        "/our-team",
+        "/leadership",
+        "/attorneys",
+        "/people",
+    ]
+
+    discovered_emails: Set[str] = set()
 
     for subpath in subpaths:
         try:
             full_url = target_url.rstrip("/") + subpath
             resp = requests.get(full_url, headers=headers, timeout=timeout, allow_redirects=True)
             if resp.status_code == 200 and resp.text:
-                # 1. Check mailto links first
                 soup = BeautifulSoup(resp.text, "html.parser")
+                # 1. Check mailto links first
                 for a in soup.find_all("a", href=True):
                     href = a["href"].strip()
                     if href.startswith("mailto:"):
                         mailto_val = href.split("mailto:")[1].split("?")[0].strip()
-                        emails = extract_emails_from_text(mailto_val)
-                        if emails:
-                            return emails[0]
+                        for e in extract_emails_from_text(mailto_val):
+                            if is_valid_contact_email(e, company_domain=domain):
+                                discovered_emails.add(e)
 
                 # 2. Check full page text
-                emails = extract_emails_from_text(resp.text)
-                if emails:
-                    return emails[0]
+                for e in extract_emails_from_text(resp.text):
+                    if is_valid_contact_email(e, company_domain=domain):
+                        discovered_emails.add(e)
+
+                # If a Tier 1 (direct executive/partner) email is found, short-circuit
+                tier_1_found = [e for e in discovered_emails if rank_email_address(e, domain) == 100]
+                if tier_1_found:
+                    return tier_1_found[0]
         except Exception:
             continue
 
-    return None
+    if not discovered_emails:
+        return None
+
+    # Return the highest-ranked discovered email
+    sorted_emails = sorted(
+        discovered_emails,
+        key=lambda e: rank_email_address(e, domain),
+        reverse=True,
+    )
+    return sorted_emails[0]
 
 
 # ==============================================================================
@@ -487,6 +677,51 @@ class GoogleSheetSyncManager:
             logger.error(f"Error appending rows to Google Sheet: {e}", exc_info=True)
             return False
 
+    def cleanup_invalid_records(self) -> int:
+        """
+        Scans Column E (Contact Email) of the active sheet.
+        Identifies rows containing placeholder or deliverability-invalid emails
+        and updates their Status (Column K) to 'Invalid Email - Flagged'.
+        Returns the count of flagged rows.
+        """
+        if self.dry_run and not self.worksheet:
+            logger.info("[DRY-RUN] Simulating sheet hygiene scan on active worksheet.")
+            return 0
+
+        if not self.worksheet:
+            logger.warning("No active worksheet connection; cannot perform cleanup.")
+            return 0
+
+        try:
+            all_rows = self.worksheet.get_all_values()
+            if len(all_rows) <= 1:
+                logger.info("Sheet has no data rows to clean.")
+                return 0
+
+            flagged_count = 0
+            # Row 1 is header, data starts at index 2 (1-based for gspread)
+            for row_idx, row in enumerate(all_rows[1:], start=2):
+                website = row[3].strip() if len(row) >= 4 else ""
+                email = row[4].strip() if len(row) >= 5 else ""
+                current_status = row[10].strip() if len(row) >= 11 else ""
+
+                dom = normalize_domain(website) if website else None
+                is_valid = bool(email and is_valid_contact_email(email, company_domain=dom))
+
+                if not is_valid and current_status != "Invalid Email - Flagged":
+                    flagged_count += 1
+                    logger.warning(
+                        f"Row {row_idx}: Flagging invalid/placeholder email '{email}' for site '{website}'."
+                    )
+                    if not self.dry_run:
+                        self.worksheet.update_cell(row_idx, 11, "Invalid Email - Flagged")
+
+            logger.info(f"Sheet hygiene cleanup complete. Flagged {flagged_count} invalid records.")
+            return flagged_count
+        except Exception as e:
+            logger.error(f"Error during sheet hygiene cleanup: {e}", exc_info=True)
+            return 0
+
 
 # ==============================================================================
 # Step 3.2: Multi-Region Scraping & Fallback Email Extractor
@@ -555,19 +790,22 @@ class ProspectScraper:
             if dom in existing_domains or dom in seen_batch_domains:
                 continue
 
-            # Fallback email resolution if missing
+            # Fallback email resolution if missing or invalid placeholder
             email = raw.get("contact_email")
+            if email and not is_valid_contact_email(email, company_domain=dom):
+                email = None
+
             if not email or "@" not in email:
                 if not self.mock:
-                    logger.debug(f"Missing email for {dom}. Probing website fallback...")
+                    logger.debug(f"Missing or invalid email for {dom}. Probing website fallback...")
                     email = scrape_email_from_website(website)
                 else:
                     # In mock mode, supply realistic domain email
-                    clean_name = re.sub(r"[^a-zA-Z]", "", raw.get("company_name", "contact")).lower()
-                    email = f"info@{dom}"
+                    email = f"partner@{dom}"
 
-            if not email:
-                continue  # Drop candidate if email could not be discovered
+            if not email or not is_valid_contact_email(email, company_domain=dom):
+                logger.debug(f"Discarding lead {dom}: no recoverable deliverable email found.")
+                continue  # Discard lead to protect deliverability and sender reputation
 
             seen_batch_domains.add(dom)
             candidate = ProspectCandidate(
@@ -855,25 +1093,84 @@ class ColdEmailDraftsman:
     def _fallback_pitch(self, candidate: ProspectCandidate, evaluation: LeadEvaluation) -> EmailPitch:
         domain = normalize_domain(candidate.website)
         first_name = candidate.company_name.split()[0]
+        full_name = candidate.company_name
+        dom_hash = sum(ord(c) for c in (candidate.website + candidate.company_name))
+
         if evaluation.offer_angle == "Authority Website":
-            subject = f"{first_name} digital authority positioning"
-            body = (
-                f"Hi {first_name} team,\n\n"
-                f"Reviewed {domain} this morning. Noticed your case studies and advisory credentials are buried below the fold, "
-                f"meaning high-value prospective clients often miss your core track record.\n\n"
-                f"We recently redesigned the positioning architecture for a similar firm, increasing enterprise conversion by 34%.\n\n"
-                f"Put together a quick 90-second video teardown showing where prospective clients drop off on {domain}. "
-                f"Mind if I share the link here?"
-            )
+            subject_options = [
+                f"Quick observation re: {domain} intake",
+                f"Question re: {full_name} case studies",
+                f"Quick note on {domain} consultation flow",
+                f"Observation re: {first_name} prospective client drop-off",
+                f"Quick thought re: {domain} credential layout",
+            ]
+            subject = subject_options[dom_hash % len(subject_options)]
+
+            body_templates = [
+                (
+                    f"Hi {first_name} team,\n\n"
+                    f"Reviewed {domain} this morning. Noticed your client case studies and advisory credentials are buried below the fold, "
+                    f"meaning prospective corporate clients often drop off before seeing your track record.\n\n"
+                    f"We clean up digital friction points and restructure intake layouts so qualified enterprise leads actually schedule consultations.\n\n"
+                    f"Put together a 90-second video teardown showing two navigation bottlenecks on {domain}. "
+                    f"Mind if I send the link over?"
+                ),
+                (
+                    f"Hi {first_name} team,\n\n"
+                    f"Spent a few minutes on {domain} earlier today. Your firm's recent client results are strong, but the consultation booking path "
+                    f"requires several manual steps that cause high-value prospects to bounce.\n\n"
+                    f"We streamline prospective client flows for specialized firms so qualified leads can book directly with your team.\n\n"
+                    f"Recorded a concise 90-second Loom walkthrough showing how to fix that drop-off point. "
+                    f"Open to taking a look?"
+                ),
+                (
+                    f"Hi {first_name} team,\n\n"
+                    f"Took a look at {domain}. While your practice expertise is evident, your mobile intake flow has noticeable friction "
+                    f"that makes it difficult for corporate decision-makers to evaluate your credentials quickly.\n\n"
+                    f"We fix mobile drop-offs and modernize key trust elements so high-ticket inquiries actually convert into calls.\n\n"
+                    f"Mapped out a quick preview comparing your current flow with a streamlined alternative. "
+                    f"Mind if I share it here?"
+                ),
+            ]
+            body = body_templates[dom_hash % len(body_templates)]
         else:
-            subject = f"inquiry qualification on {domain}"
-            body = (
-                f"Hi {first_name} team,\n\n"
-                f"Took a look at {domain}. Your inbound intake currently relies on static forms without automated qualification, "
-                f"costing your team billable hours filtering unqualified leads.\n\n"
-                f"We implement interactive AI qualification funnels that pre-vet deal size and sync booked consultations directly.\n\n"
-                f"Built a quick interactive preview mockup showing how this would operate on {domain}. Open to a 2-minute walkthrough?"
-            )
+            subject_options = [
+                f"Mobile booking friction on {domain}",
+                f"Idea for {full_name} proposal triage",
+                f"Quick observation re: {domain} intake",
+                f"Quick note on {domain} consultation flow",
+                f"Inquiry qualification question for {first_name}",
+            ]
+            subject = subject_options[dom_hash % len(subject_options)]
+
+            body_templates = [
+                (
+                    f"Hi {first_name} team,\n\n"
+                    f"Took a look at {domain}. Your inbound intake currently relies on static contact forms without automated qualification, "
+                    f"costing your team billable hours filtering unqualified inquiries.\n\n"
+                    f"We build automated intake flows so senior partners stop wasting billable time on unqualified inquiries.\n\n"
+                    f"Built a quick interactive preview mockup showing how this would operate on {domain}. "
+                    f"Open to a 2-minute walkthrough?"
+                ),
+                (
+                    f"Hi {first_name} team,\n\n"
+                    f"Quick note after reviewing {domain}. Right now your website sends every inquiry into a general inbox, "
+                    f"leaving your team to manually triage deal sizes and project scopes.\n\n"
+                    f"We set up interactive inquiry flows that automatically pre-qualify budget and project fit before consultations are scheduled.\n\n"
+                    f"Put together an interactive preview showing how this would run on {domain}. "
+                    f"Mind if I send the link?"
+                ),
+                (
+                    f"Hi {first_name} team,\n\n"
+                    f"Noticed on {domain} that your team handles client intake through open-ended web forms. "
+                    f"This typically means your senior staff spend several hours each week fielding calls that aren't a commercial fit.\n\n"
+                    f"We install smart qualification funnels that screen prospective clients and schedule high-intent leads automatically.\n\n"
+                    f"Drafted a 90-second preview of how this flow looks for category peers. "
+                    f"Would you be open to seeing it?"
+                ),
+            ]
+            body = body_templates[dom_hash % len(body_templates)]
+
         return EmailPitch(subject=subject, email_body=body)
 
     def draft_email_pitch(self, candidate: ProspectCandidate, evaluation: LeadEvaluation) -> EmailPitch:
@@ -883,6 +1180,7 @@ class ColdEmailDraftsman:
         if self.mock or (not self.client and not self.api_key):
             return self._fallback_pitch(candidate, evaluation)
 
+        domain = normalize_domain(candidate.website)
         prompt = f"""Write a bespoke, direct cold email to:
 Company: {candidate.company_name}
 Website: {candidate.website}
@@ -892,13 +1190,23 @@ Core Bottleneck / Pain Point: {evaluation.primary_pain_point}
 
 Strict Guidelines:
 1. Under 110 words total.
-2. Peer-to-peer, direct, technical tone.
-3. ABSOLUTELY NO AI CLICHES: Never use "I hope this email finds you well", "synergy", "in today's competitive landscape", "delve", "game-changer", "stumbled upon your website", "testament", "unlock".
+2. Peer-to-peer, direct, conversational tone focusing on practical operational outcomes.
+3. ABSOLUTELY NO AGENCY JARGON OR AI CLICHES:
+   - NEVER use buzzwords: "digital conversion architecture", "institutional-grade credibility markers", "prestige-tier conversion positioning", "positioning architecture", "digital authority funnels".
+   - NEVER use AI cliches: "unlock", "delve", "synergy", "game-changer", "I hope this email finds you well", "stumbled upon your website", "testament", "in today's competitive landscape".
+   - Focus strictly on concrete operational outcomes (e.g. "We clean up digital friction points so high-value corporate leads actually book a call", "We fix mobile drop-offs so prospective clients actually schedule consultations", "We build automated intake flows so senior partners stop wasting billable time on unqualified inquiries").
 4. Structure:
    - Specific technical observation of their bottleneck on {candidate.website}.
-   - Commercial implication (missed enterprise deals or wasted partner hours).
+   - Commercial implication (missed enterprise deals or wasted partner billable hours).
    - Zero-pressure CTA offering a 90-second Loom teardown or interactive preview link.
-5. Subject line: 3-6 words, lowercase/natural, curiosity-driven (e.g., "quick observation on {candidate.company_name}").
+5. Subject line:
+   - 3-6 words, natural, curiosity-driven. Avoid repetitive '[Topic] on [domain]' templates.
+   - Choose dynamically from patterns like:
+     * Quick observation re: {domain} intake
+     * Mobile booking friction on {domain}
+     * Question re: {candidate.company_name} case studies
+     * Quick note on {domain} consultation flow
+     * Idea for {candidate.company_name} proposal triage
 
 Respond ONLY with valid JSON:
 {{
@@ -949,6 +1257,9 @@ class LeadGenerationPipeline:
             raise RuntimeError(
                 "Failed to connect to Google Sheets! Please verify that GOOGLE_SERVICE_ACCOUNT_JSON contains the complete service account JSON and that GOOGLE_SHEET_ID is set."
             )
+        if self.config.get("cleanup_sheet"):
+            logger.info("Executing Google Sheets hygiene cleanup (--cleanup-sheet)...")
+            self.sheet_manager.cleanup_invalid_records()
         existing_domains = self.sheet_manager.get_existing_domains()
 
         # Step 3.2: Multi-Region Scraping
@@ -976,6 +1287,9 @@ class LeadGenerationPipeline:
         logger.info(f"Generating personalized cold email pitches for top {len(top_10)} candidates...")
         for candidate, evaluation in top_10:
             pitch = self.draftsman.draft_email_pitch(candidate, evaluation)
+            dom = normalize_domain(candidate.website)
+            tier = rank_email_address(candidate.contact_email, dom)
+            status = "Pending Review [Review Email]" if tier <= 30 else "Pending Review"
             record = FinalLeadRecord(
                 date_added=today_str,
                 company_name=candidate.company_name,
@@ -987,7 +1301,7 @@ class LeadGenerationPipeline:
                 primary_pain_point=evaluation.primary_pain_point,
                 subject=pitch.subject,
                 email_body=pitch.email_body,
-                status="Pending Review",
+                status=status,
             )
             final_records.append(record)
 
@@ -1002,6 +1316,13 @@ class LeadGenerationPipeline:
 
         logger.info("Daily pipeline execution completed successfully.")
         return final_records
+
+    def cleanup_sheet(self) -> int:
+        """
+        Connects to Google Sheets and flags rows containing invalid or placeholder emails.
+        """
+        self.sheet_manager.connect()
+        return self.sheet_manager.cleanup_invalid_records()
 
     def _display_summary(self, records: List[FinalLeadRecord]) -> None:
         """
@@ -1054,6 +1375,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model", type=str, default=None, help=f"Override model (default: {DEFAULT_LLM_MODEL})")
     parser.add_argument("--api-key", type=str, default=None, help="NVIDIA NIM API key")
     parser.add_argument("--worksheet", type=str, default=None, help=f"Target worksheet tab (default: {DEFAULT_WORKSHEET_NAME})")
+    parser.add_argument("--cleanup-sheet", action="store_true", help="Scan active Google Sheet and flag rows with invalid/placeholder emails")
     return parser.parse_args()
 
 
@@ -1085,6 +1407,7 @@ def load_config(args: argparse.Namespace) -> Dict[str, Any]:
         "mock": args.mock or (os.environ.get("MOCK_SCRAPE", "").lower() in ("true", "1", "yes")),
         "niche": args.niche or os.environ.get("NICHE_OVERRIDE"),
         "region": args.region or os.environ.get("REGION_OVERRIDE"),
+        "cleanup_sheet": getattr(args, "cleanup_sheet", False) or (os.environ.get("CLEANUP_SHEET", "").lower() in ("true", "1", "yes")),
     }
 
 
